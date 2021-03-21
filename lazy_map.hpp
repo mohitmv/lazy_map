@@ -74,10 +74,10 @@ class lazy_map {
         return (*p)->values_.at(k);
       }
       if (contains_key((*p)->deleted_keys_, k)) {
-        throw std::runtime_error(key_error);
+        throw std::out_of_range(key_error);
       }
     }
-    throw std::runtime_error(key_error);
+    throw std::out_of_range(key_error);
   }
 
   const V& operator[](const K& k) const {
