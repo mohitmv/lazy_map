@@ -86,7 +86,7 @@ struct Fragment {
   std::shared_ptr<Fragment> parent;
   std::unordered_map<K, V> key_values;
   std::unordered_set<K> deleted_keys;
-}
+};
 ```
 
 A fragment records the deleted keys as well as updated key-value pairs.
