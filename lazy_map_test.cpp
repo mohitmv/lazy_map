@@ -1,7 +1,7 @@
 // Copyright: ThoughtSpot Inc. 2021
 // Author: Mohit Saini (mohit.saini@thoughtspot.com)
 
-#include "ts/lazy_map.hpp"
+#include "lazy_map.hpp"
 
 #include <vector>
 #include <unordered_map>
@@ -9,16 +9,37 @@
 #include <utility>
 
 #include "gtest/gtest.h"
-#include "glog/logging.h"
 
-#include "testing/cpp/copy_move_counter.hpp"
+struct CopyMoveCounter {
+  using This = CopyMoveCounter;
+  struct Info {
+    int copy_ctr = 0;
+    int copy_assign = 0;
+    int move_ctr = 0;
+    int move_assign = 0;
+    int value_ctr = 0;
+    int moves() const { return move_ctr + move_assign; }
+    int copies() const { return copy_ctr + copy_assign; }
+    int total() const { return moves() + copies() + value_ctr; }
+    void reset() { *this = Info(); }
+  };
+  CopyMoveCounter(Info* info): info_(info) { ++(info_->value_ctr); }
+  CopyMoveCounter(const This& o): info_(o.info_) { ++(info_->copy_ctr); }
+  CopyMoveCounter(This&& o) noexcept : info_(o.info_) { ++(info_->move_ctr); }
+  This& operator=(const This& o) {
+    info_ = o.info_;
+    ++(info_->copy_assign);
+    return *this;
+  }
+  This& operator=(This&& o) noexcept {
+    info_ = o.info_;
+    ++(info_->move_assign);
+    return *this;
+  }
+  Info* info_;
+};
 
-using std::vector;
-using std::cout;
-using std::endl;
-using testing::cpp::CopyMoveCounter;
-
-namespace ts {
+namespace quick {
 
 template<typename M>
 std::unordered_set<typename M::key_type> GetKeys(const M& m) {
@@ -143,7 +164,7 @@ TEST(LazyMapTest, IteratorTest) {
 }
 
 TEST(LazyMapTest, CopyMoveInsertion) {
-  ts::lazy_map<int, CopyMoveCounter> m;
+  quick::lazy_map<int, CopyMoveCounter> m;
   CopyMoveCounter::Info info;
   m.insert(10, CopyMoveCounter(&info));
   EXPECT_EQ(1, info.moves());
@@ -161,4 +182,9 @@ TEST(LazyMapTest, CopyMoveInsertion) {
   EXPECT_EQ(1, info.total());
 }
 
-}  // namespace ts
+}  // namespace quick
+
+int main(int argc, char **argv) {
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

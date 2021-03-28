@@ -1,22 +1,18 @@
-// Copyright: ThoughtSpot Inc. 2021
 // Author: Mohit Saini (mohit.saini@thoughtspot.com)
 
-// The documentation (ts/lazy_map.md) MUST be read twice
+// The documentation (lazy_map.md) MUST be read twice
 // before using this utility.
 
-#ifndef TS_LAZY_MAP_HPP_
-#define TS_LAZY_MAP_HPP_
+#ifndef QUICK_LAZY_MAP_HPP_
+#define QUICK_LAZY_MAP_HPP_
 
-#include <assert.h>
-
+#include <cassert>
 #include <memory>
 #include <utility>
-#include <vector>
 #include <unordered_map>
 #include <unordered_set>
-#include <string>
 
-namespace ts {
+namespace quick {
 namespace lazy_map_impl {
 
 constexpr const char* key_error = "[lazy_map]: Key not found";
@@ -31,6 +27,7 @@ class lazy_map {
   class const_iter_impl;
   using underlying_map = typename std::unordered_map<K, V>;
   using underlying_const_iter = typename underlying_map::const_iterator;
+  struct Fragment;
 
  public:
   using key_type = K;
@@ -40,12 +37,12 @@ class lazy_map {
   using iterator = const_iterator;
   using reference = value_type&;
   using const_reference = const value_type&;
-  lazy_map() : node_(std::make_shared<Node>()) { }
+  lazy_map() : head_(std::make_shared<Fragment>()) { }
   lazy_map(std::initializer_list<value_type> values)
-    : node_(std::make_shared<Node>(values)) { }
+    : head_(std::make_shared<Fragment>(values)) { }
   template<typename InputIt>
   lazy_map(InputIt first, InputIt last)
-    : node_(std::make_shared<Node>(first, last)) { }
+    : head_(std::make_shared<Fragment>(first, last)) { }
 
   bool detach() {
     prepare_for_edit();
@@ -53,7 +50,7 @@ class lazy_map {
   }
 
   bool is_detached() const {
-    return (node_->parent_ == nullptr);
+    return (head_->parent() == nullptr);
   }
 
   bool contains(const K& k) const {
@@ -62,22 +59,19 @@ class lazy_map {
 
   size_t get_depth() const {
     size_t depth = 0;
-    for (auto* p = &node_->parent_; (*p) != nullptr; p = &((*p)->parent_)) {
+    for (const Fragment* p = head_->parent(); p != nullptr; p = p->parent()) {
       depth++;
     }
     return depth;
   }
 
   const V& at(const K& k) const {
-    for (auto* p = &node_; (*p) != nullptr; p = &((*p)->parent_)) {
-      if (contains_key((*p)->values_, k)) {
-        return (*p)->values_.at(k);
-      }
-      if (contains_key((*p)->deleted_keys_, k)) {
-        throw std::out_of_range(key_error);
-      }
+    auto&& it = find(k);
+    if (it.is_end()) {
+      throw std::out_of_range(key_error);
+    } else {
+      return it->second;
     }
-    throw std::out_of_range(key_error);
   }
 
   const V& operator[](const K& k) const {
@@ -85,32 +79,32 @@ class lazy_map {
   }
 
   size_t size() const {
-    return node_->size_;
+    return head_->size_;
   }
 
   bool empty() const {
-    return (node_->size_ == 0);
+    return (head_->size_ == 0);
   }
 
   void insert_or_assign(const K& k, const V& v) {
     prepare_for_edit();
-    node_->size_ += contains_internal(k) ? 0: 1;
-    node_->deleted_keys_.erase(k);
-    if (contains_key(node_->values_, k)) {
-      node_->values_.at(k) = v;
+    head_->size_ += contains_internal(k) ? 0: 1;
+    head_->deleted_keys_.erase(k);
+    if (contains_key(head_->key_values_, k)) {
+      head_->key_values_.at(k) = v;
     } else {
-      node_->values_.emplace(k, v);
+      head_->key_values_.emplace(k, v);
     }
   }
 
   void insert_or_assign(const K& k, V&& v) {
     prepare_for_edit();
-    node_->size_ += contains_internal(k) ? 0: 1;
-    node_->deleted_keys_.erase(k);
-    if (contains_key(node_->values_, k)) {
-      node_->values_.at(k) = std::move(v);
+    head_->size_ += contains_internal(k) ? 0: 1;
+    head_->deleted_keys_.erase(k);
+    if (contains_key(head_->key_values_, k)) {
+      head_->key_values_.at(k) = std::move(v);
     } else {
-      node_->values_.emplace(k, std::move(v));
+      head_->key_values_.emplace(k, std::move(v));
     }
   }
 
@@ -135,18 +129,18 @@ class lazy_map {
   bool insert(const K& k, const V& v) {
     if (contains_internal(k)) return false;
     prepare_for_edit();
-    node_->deleted_keys_.erase(k);
-    node_->values_.emplace(k, v);
-    node_->size_++;
+    head_->deleted_keys_.erase(k);
+    head_->key_values_.emplace(k, v);
+    head_->size_++;
     return true;
   }
 
   bool insert(const K& k, V&& v) {
     if (contains_internal(k)) return false;
     prepare_for_edit();
-    node_->deleted_keys_.erase(k);
-    node_->values_.emplace(k, std::move(v));
-    node_->size_++;
+    head_->deleted_keys_.erase(k);
+    head_->key_values_.emplace(k, std::move(v));
+    head_->size_++;
     return true;
   }
 
@@ -162,27 +156,27 @@ class lazy_map {
   bool emplace(const K& k, Args&&... args) {
     if (contains_internal(k)) return false;
     prepare_for_edit();
-    node_->deleted_keys_.erase(k);
-    node_->values_.emplace(std::piecewise_construct,
+    head_->deleted_keys_.erase(k);
+    head_->key_values_.emplace(std::piecewise_construct,
                            std::forward_as_tuple(k),
                            std::tuple<Args&&...>(std::forward<Args>(args)...));
-    node_->size_++;
+    head_->size_++;
     return true;
   }
 
   void clear() {
     // No need to prepare_for_edit.
-    node_ = std::make_shared<Node>();
+    head_ = std::make_shared<Fragment>();
   }
 
   bool erase(const K& k) {
     if (not contains_internal(k)) return false;
     prepare_for_edit();
-    node_->values_.erase(k);
+    head_->key_values_.erase(k);
     if (contains_internal(k)) {
-      node_->deleted_keys_.insert(k);
+      head_->deleted_keys_.insert(k);
     }
-    node_->size_--;
+    head_->size_--;
     return true;
   }
 
@@ -196,16 +190,16 @@ class lazy_map {
     if (not contains_internal(k)) return nullptr;
     prepare_for_edit();
     std::unique_ptr<V> output;
-    if (contains_key(node_->values_, k)) {
-      output = std::make_unique<V>(std::move(node_->values_[k]));
+    if (contains_key(head_->key_values_, k)) {
+      output = std::make_unique<V>(std::move(head_->key_values_[k]));
     } else {
       output = std::make_unique<V>(at(k));
     }
-    node_->values_.erase(k);
+    head_->key_values_.erase(k);
     if (contains_internal(k)) {
-      node_->deleted_keys_.insert(k);
+      head_->deleted_keys_.insert(k);
     }
-    node_->size_--;
+    head_->size_--;
     return output;
   }
 
@@ -222,25 +216,25 @@ class lazy_map {
   // - Non-standard map method.
   std::unique_ptr<V> move(const K& k) {
     if (not contains_internal(k)) return nullptr;
-    if (node_.unique() and contains_key(node_->values_, k)) {
-      return std::make_unique<V>(std::move(node_->values_[k]));
+    if (head_.unique() and contains_key(head_->key_values_, k)) {
+      return std::make_unique<V>(std::move(head_->key_values_[k]));
     } else {
       return std::make_unique<V>(at(k));
     }
   }
 
-  // Similar to move(k) method. In adding, it return the nullptr if the value
+  // Similar to move(k) method. In addition, it return the nullptr if the value
   // is shared instead of copying value.
   std::unique_ptr<V> move_only(const K& k) {
     if (not contains_internal(k)) return nullptr;
-    if (node_.unique() and contains_key(node_->values_, k)) {
-      return std::make_unique<V>(std::move(node_->values_[k]));
+    if (head_.unique() and contains_key(head_->key_values_, k)) {
+      return std::make_unique<V>(std::move(head_->key_values_[k]));
     }
     return nullptr;
   }
 
   const_iter_impl begin() const {
-    return const_iter_impl(node_.get());
+    return const_iter_impl(head_.get());
   }
 
   const_iter_impl end() const {
@@ -248,30 +242,30 @@ class lazy_map {
   }
 
   const_iterator find(const K& k) const {
-    for (Node* p = node_.get(); p != nullptr; p = p->parent_.get()) {
-      auto it = p->values_.find(k);
-      if (it != p->values_.end()) {
-        return const_iterator(node_.get(), p, std::move(it));
+    for (const Fragment* p = head_.get(); p != nullptr; p = p->parent()) {
+      auto it = p->key_values_.find(k);
+      if (it != p->key_values_.end()) {
+        return const_iter_impl(head_.get(), p, std::move(it));
       }
       if (contains_key(p->deleted_keys_, k)) {
-        return const_iterator();
+        return const_iter_impl(nullptr);
       }
     }
-    return const_iterator();
+    return const_iter_impl(nullptr);
   }
 
  private:
   bool insert_internal(const K& k, const V& v) {
     if (contains_internal(k)) return false;
-    node_->deleted_keys_.erase(k);
-    node_->values_.emplace(k, v);
-    node_->size_++;
+    head_->deleted_keys_.erase(k);
+    head_->key_values_.emplace(k, v);
+    head_->size_++;
     return true;
   }
 
-  bool contains_internal(const K& k) const {
-    for (Node* p = node_.get(); p != nullptr; p = p->parent_.get()) {
-      if (contains_key(p->values_, k)) {
+  static bool contains_internal(const Fragment* node, const K& k) {
+    for (const Fragment* p = node; p != nullptr; p = p->parent()) {
+      if (contains_key(p->key_values_, k)) {
         return true;
       }
       if (contains_key(p->deleted_keys_, k)) {
@@ -281,44 +275,51 @@ class lazy_map {
     return false;
   }
 
+  bool contains_internal(const K& k) const {
+    return contains_internal(head_.get(), k);
+  }
+
   void prepare_for_edit() {
-    if (not node_.unique()) {
-      auto new_node = std::make_shared<Node>(std::move(node_));
-      node_ = std::move(new_node);
+    if (not head_.unique()) {
+      auto new_node = std::make_shared<Fragment>(std::move(head_));
+      head_ = std::move(new_node);
     }
   }
 
   bool detach_internal() {
-    if (node_->parent_ == nullptr) return false;
-    for (auto* p = &node_->parent_; (*p) != nullptr; p = &((*p)->parent_)) {
-      for (auto& v : (*p)->values_) {
-        if (not contains_key(node_->deleted_keys_, v.first)) {
-          node_->values_.emplace(v.first, v.second);
+    if (head_->parent_ == nullptr) return false;
+    for (auto* p = &head_->parent_; (*p) != nullptr; p = &((*p)->parent_)) {
+      for (auto& v : (*p)->key_values_) {
+        if (not contains_key(head_->deleted_keys_, v.first)) {
+          head_->key_values_.emplace(v.first, v.second);
         }
       }
       const auto& d = (*p)->deleted_keys_;
-      node_->deleted_keys_.insert(d.begin(), d.end());
+      head_->deleted_keys_.insert(d.begin(), d.end());
     }
-    node_->deleted_keys_.clear();
-    node_->parent_ = nullptr;
+    head_->deleted_keys_.clear();
+    head_->parent_ = nullptr;
     return true;
   }
 
-  struct Node {
-    Node() = default;
-    explicit Node(std::shared_ptr<Node>&& parent)
+  struct Fragment {
+    Fragment() = default;
+    explicit Fragment(std::shared_ptr<Fragment>&& parent)
       : parent_(std::move(parent)), size_(parent_->size_) { }
-    explicit Node(std::initializer_list<value_type> values)
-      : values_(values), size_(values_.size()) { }
-    explicit Node(const std::unordered_map<K, V>& other_map)
-      : values_(other_map), size_(values_.size()) { }
-    explicit Node(std::unordered_map<K, V>&& other_map)
-      : values_(std::move(other_map)), size_(values_.size()) { }
+    explicit Fragment(std::initializer_list<value_type> values)
+      : key_values_(values), size_(key_values_.size()) { }
+    explicit Fragment(const std::unordered_map<K, V>& other_map)
+      : key_values_(other_map), size_(key_values_.size()) { }
+    explicit Fragment(std::unordered_map<K, V>&& other_map)
+      : key_values_(std::move(other_map)), size_(key_values_.size()) { }
     template<typename InputIt>
-    Node(InputIt first, InputIt last)
-      : values_(first, last), size_(values_.size()) { }
-    std::shared_ptr<Node> parent_;
-    std::unordered_map<K, V> values_;
+    Fragment(InputIt first, InputIt last)
+      : key_values_(first, last), size_(key_values_.size()) { }
+    // Returns const parent. UB if parent is nullptr.
+    const Fragment* parent() const { return parent_.get(); };
+    Fragment* mutable_parent() { return parent_.get(); };
+    std::shared_ptr<Fragment> parent_;
+    std::unordered_map<K, V> key_values_;
     std::unordered_set<K> deleted_keys_;
     size_t size_ = 0;
   };
@@ -332,14 +333,14 @@ class lazy_map {
    public:
     // Default constructed iterator is the end() iterator.
     const_iter_impl() = default;
-    const_iter_impl(const Node* head,
-                    const Node* current,
+    const_iter_impl(const Fragment* head,
+                    const Fragment* current,
                     underlying_const_iter&& it)
       : head_(head), current_(current), it_(std::move(it)) {}
 
-    const_iter_impl(const Node* head): head_(head), current_(head) {
+    const_iter_impl(const Fragment* head): head_(head), current_(head) {
       if (current_) {
-        it_ = current_->values_.begin();
+        it_ = current_->key_values_.begin();
         if (not move_forward_to_closest_non_deleted_valid_position()) {
           current_ = nullptr;
         }
@@ -372,6 +373,8 @@ class lazy_map {
     auto* operator->() const {
       return it_.operator->();
     }
+    bool is_end() const { return current_ == nullptr; }
+
    private:
     // - Precondition(@current_ != nullptr)
     // - Postcondition(@current_ != nullptr)
@@ -395,19 +398,19 @@ class lazy_map {
     //   already on a valid position).
     // - Return false if we failed to move forward to a valid position.
     bool move_forward_to_closest_valid_position() {
-      while (it_ == current_->values_.end()) {
+      while (it_ == current_->key_values_.end()) {
         if (current_->parent_ == nullptr) {
           return false;
         }
         current_ = current_->parent_.get();
-        it_ = current_->values_.begin();
+        it_ = current_->key_values_.begin();
       }
       return true;
     }
     // Precondition(@current_ != nullptr)
     bool should_ignore_key(const K& k) const {
       for (auto c = head_; c != current_; c = c->parent_.get()) {
-        if (contains_key(c->values_, k)
+        if (contains_key(c->key_values_, k)
              or contains_key(c->deleted_keys_, k)) {
           return true;
         }
@@ -415,21 +418,24 @@ class lazy_map {
       return false;
     }
     // Invariant(head_ != nullptr || current_ == nullptr)
-    const Node* head_ = nullptr;
+    const Fragment* head_ = nullptr;
     // current_ == nullptr means that this iterator is the `end()`
-    const Node* current_ = nullptr;
-    // Belongs to the containr current_->values_ if current_ is not nullptr.
+    const Fragment* current_ = nullptr;
+    // `it_` is a iterator of `current_->key_values_` container if @current_
+    // is not nullptr. Default constructed o.w.
     underlying_const_iter it_;
     friend class lazy_map;
   };
   friend class lazy_map_test_internals;
-  std::shared_ptr<Node> node_;
+
+ private:
+  std::shared_ptr<Fragment> head_;
 };
 
 }  // namespace lazy_map_impl
 
 using lazy_map_impl::lazy_map;
 
-}  // namespace ts
+}  // namespace quick
 
-#endif  // TS_LAZY_MAP_HPP_
+#endif  // QUICK_LAZY_MAP_HPP_
