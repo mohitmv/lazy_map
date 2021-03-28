@@ -18,8 +18,29 @@ namespace lazy_map_impl {
 constexpr const char* key_error = "[lazy_map]: Key not found";
 
 template<typename C, typename K>
-inline bool contains_key(const C& c, const K& k) {
+bool contains_key(const C& c, const K& k) {
   return (c.find(k) != c.end());
+}
+
+// Given a mutable map and it's const_iterator, return the mutable iterator
+// corresponding to the given const_iterator.
+// Note: here 'erase' is not doing anything because size of range = 0, since
+// begin == end here. We are abusing 'erase' method to return non-const iter.
+template<typename M>
+typename M::iterator to_non_const_iter(
+    M& m, typename M::const_iterator const_it) {
+  return m.erase(const_it, const_it);
+}
+
+// Does : `container[k] = v`  in a better way.
+template<typename C, typename K, typename V>
+void put_key_value(C& container, K&& k, V&& v) {
+  auto&& it = container.find(k);
+  if (it == container.end()) {
+    container.emplace(std::forward<K>(k), std::forward<V>(v));
+  } else {
+    it->second = std::forward<V>(v);
+  }
 }
 
 template<typename K, typename V>
@@ -32,7 +53,7 @@ class lazy_map {
  public:
   using key_type = K;
   using mapped_type = V;
-  using value_type = std::pair<const K, V>;
+  using value_type = typename underlying_map::value_type;
   using const_iterator = const_iter_impl;
   using iterator = const_iterator;
   using reference = value_type&;
@@ -83,29 +104,21 @@ class lazy_map {
   }
 
   bool empty() const {
-    return (head_->size_ == 0);
+    return size() == 0;
   }
 
   void insert_or_assign(const K& k, const V& v) {
     prepare_for_edit();
     head_->size_ += contains_internal(k) ? 0: 1;
     head_->deleted_keys_.erase(k);
-    if (contains_key(head_->key_values_, k)) {
-      head_->key_values_.at(k) = v;
-    } else {
-      head_->key_values_.emplace(k, v);
-    }
+    put_key_value(head_->key_values_, k, v);
   }
 
   void insert_or_assign(const K& k, V&& v) {
     prepare_for_edit();
     head_->size_ += contains_internal(k) ? 0: 1;
     head_->deleted_keys_.erase(k);
-    if (contains_key(head_->key_values_, k)) {
-      head_->key_values_.at(k) = std::move(v);
-    } else {
-      head_->key_values_.emplace(k, std::move(v));
-    }
+    put_key_value(head_->key_values_, k, std::move(v));
   }
 
   void insert_or_assign(const value_type& kv) {
@@ -180,57 +193,60 @@ class lazy_map {
     return true;
   }
 
-  // - Erase the given key and return the erased value. If the key-value pair
-  //   is not shared by other objects, move the value in output. If the
-  //   key-value pair is shared by other objects, copy the value for returning.
-  // - It is useful when we need to update a value efficiently.
-  // - Returns nullptr only if the key doesn't exists.
-  // - Non-standard map method.
-  std::unique_ptr<V> move_and_erase(const K& k) {
-    if (not contains_internal(k)) return nullptr;
-    prepare_for_edit();
-    std::unique_ptr<V> output;
-    if (contains_key(head_->key_values_, k)) {
-      output = std::make_unique<V>(std::move(head_->key_values_[k]));
-    } else {
-      output = std::make_unique<V>(at(k));
-    }
-    head_->key_values_.erase(k);
-    if (contains_internal(k)) {
-      head_->deleted_keys_.insert(k);
-    }
-    head_->size_--;
-    return output;
-  }
-
-  // - Move out the value of a key and return. Return nullptr if the key
+  // - Move out the value of a key and return. Raise exception if the key
   //   doesn't exists. If the value is shared by other objects, it will be
   //   copied.
   // - It is useful when we need to update the value efficiently.
-  // - Equivalent of std::make_unique<V>(std::move(my_map[key])) in standard
-  //   map.
+  // - Equivalent of std::move(my_map.at(key)) in standard map.
   // - Since lazy_map don't expose mutable iternal reference,
   //   only way to update a value of key is: copy/move it in a variable, update
   //   it and then insert_or_assign it again.
-  // - Return nullptr if either the key doesn't exists.
-  // - Non-standard map method.
-  std::unique_ptr<V> move(const K& k) {
-    if (not contains_internal(k)) return nullptr;
-    if (head_.unique() and contains_key(head_->key_values_, k)) {
-      return std::make_unique<V>(std::move(head_->key_values_[k]));
+  // - This is a non-standard map method.
+  V move(const K& k) {
+    auto&& iter = find(k);
+    if (iter.is_end()) {
+      throw std::out_of_range(key_error);
     } else {
-      return std::make_unique<V>(at(k));
+      return move(iter);
     }
   }
 
-  // Similar to move(k) method. In addition, it return the nullptr if the value
-  // is shared instead of copying value.
-  std::unique_ptr<V> move_only(const K& k) {
-    if (not contains_internal(k)) return nullptr;
-    if (head_.unique() and contains_key(head_->key_values_, k)) {
-      return std::make_unique<V>(std::move(head_->key_values_[k]));
+  // - Move the value at @iter from this map and return. After this operation,
+  //   iter->second will be in moved-from state.
+  // - If the value is shared by other objects, it will be copied.
+  // - If you cannot afford to copy, use move_only method.
+  // - Behavior is undefined if @iter is past the end.
+  // - This is a non-standard map method.
+  V move(const const_iter_impl& iter) {
+    if (head_.unique() and iter.current_ == head_.get()) {
+      return std::move(to_non_const_iter(head_->key_values_, iter.it_)->second);
+    } else {
+      return iter.it_->second;
     }
-    return nullptr;
+  }
+
+  // Similar to move(k) method but the difference is:
+  //  it return empty optional if the value is shared by other objects.
+  std::optional<V> move_only(const K& k) {
+    auto&& iter = find(k);
+    if (iter.is_end()) {
+      throw std::out_of_range(key_error);
+    } else {
+      return move_only(iter);
+    }
+  }
+
+  // - Move the value at @iter from this map and return. After this operation,
+  //   iter->second will be in moved-from state.
+  // - If the value is shared by other objects, empty optional will be returned.
+  // - If you cannot afford empty std::optional, use 'move' method above.
+  // - Behavior is undefined if @iter is past the end.
+  std::optional<V> move_only(const const_iter_impl& iter) {
+    if (head_.unique() and iter.current_ == head_.get()) {
+      return std::move(to_non_const_iter(head_->key_values_, iter.it_)->second);
+    } else {
+      return std::optional<V>();
+    }
   }
 
   const_iter_impl begin() const {
@@ -288,13 +304,13 @@ class lazy_map {
 
   bool detach_internal() {
     if (head_->parent_ == nullptr) return false;
-    for (auto* p = &head_->parent_; (*p) != nullptr; p = &((*p)->parent_)) {
-      for (auto& v : (*p)->key_values_) {
+    for (const Fragment* p = head_->parent(); p != nullptr; p = p->parent()) {
+      for (auto& v : p->key_values_) {
         if (not contains_key(head_->deleted_keys_, v.first)) {
           head_->key_values_.emplace(v.first, v.second);
         }
       }
-      const auto& d = (*p)->deleted_keys_;
+      const auto& d = p->deleted_keys_;
       head_->deleted_keys_.insert(d.begin(), d.end());
     }
     head_->deleted_keys_.clear();

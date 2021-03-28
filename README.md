@@ -1,15 +1,18 @@
 ## lazy_map
 
-`lazy_map` is an implementation of `std::unordered_map` that has `O(1)` 
-cost of copying irrespective of the current size of map.
+`lazy_map` is map library with `std::unordered_map` like interface that has
+`O(1)` cost of copying irrespective of the current size of map.
 The optimizations done for `O(1)` copy operation don't have any
 visible side-effects on the map interface no matter how `lazy_map`
 is used. The value semantics of the map are preserved while copying, i.e.,
 any write operation on the copied map are totally independent of copied-from
 map. For any two different `lazy_map` objects, write operation on one has no
 impact on the other one.
-The map operations like insertion, deletion, lookup etc. continue
-to cost `O(1)` as usual, except in the special case of detachment.
+The map operations like insertion, deletion, lookup etc. continues
+to cost almost `O(1)` like std::unordered_map. Well, they cost
+`O(length-of-parent-chain)` but `lazy_map` is designed for a parent-chain with
+a small max-length like 5. Learn more about parent-chain in `implementation
+detail` section.
 
 ---
 
@@ -17,9 +20,9 @@ to cost `O(1)` as usual, except in the special case of detachment.
 
 1. The iterator can get invalidated on any standard write operation (unlike
    `std::unordered_map`, which guarantees iterator stability on erase).
-   `lazy_map` offers two non standard methods `move_value` and
-   `move` to move out the value of a key. `lazy_map` guarantees iterator stability
-   on `move_value` and `move` operation.
+   `lazy_map` offers two non standard methods `move` and
+   `move_only` to move out the value of a key. `lazy_map` guarantees iterator
+   stability on `move_only` and `move` operation.
 
 2. If the cost of copy for value-type is large, it's good idea to wrap the
    value type in a `cow_wrapper` (e.g.: `lazy_map<int, cow_wrapper<V>>`)
@@ -33,14 +36,21 @@ to cost `O(1)` as usual, except in the special case of detachment.
 4. In addition to the standard `find` method, `contains` method is
    supported that takes a key and return a boolean.
 
-5. Non standard methods `move_value` and `move` take a `key` and
-   return a `unique_ptr<Value>` by moving the value at `key`.
-   `move_value` returns `nullptr` if the value is shared by other objects.
-   `move` copies the value if the value is shared by other
-   objects. Both of these method return `nullptr` if the key doesn't exist.
-   ToDo(Mohit): Revisit this point.
+5. lazy_map supports non standard member function `move(key)`
+   - Move out the value of a key and return. Raise exception if the key
+     doesn't exists. If the value is shared by other objects, it will be
+     copied.
+   - It is useful when we need to update the value efficiently.
+   - Equivalent of std::move(my_map.at(key)) in standard map.
+   - Since lazy_map don't expose mutable iternal reference,
+     only way to update a value of key is: copy/move it in a variable, update
+     it and then insert_or_assign it again.
 
----
+6. Non standard member function `move_only(key)` is similar to `move(key)`
+   method but the difference is:
+   - it return std::optional<V> instead of value type V.
+   - Returns empty optional if the value is shared by other objects.
+
 
 ### Implementation Overview:
 
@@ -87,23 +97,34 @@ detach them manually if the fragment chain is going to be very large.
 
 ```C++
 struct Fragment {
-  std::shared_ptr<Fragment> parent;
+  std::shared_ptr<Fragment> parent;  // parent fragment.
   std::unordered_map<K, V> key_values;
   std::unordered_set<K> deleted_keys;
 };
+
 ```
+
+#### lazy_map class state:
+
+```C++
+struct lazy_map {
+  std::shared_ptr<Fragment> head;
+};
+```
+
 
 A fragment records the deleted keys as well as updated key-value pairs.
 
 The absolute value of a fragment is computed as follows:
 ```C++
 AbsoluteValue(fragment) {
-  if (fragment.parent == nullptr) return fragment.key_values;
-  else {
-    let m = AbsoluteValue(*fragment.parent);
-    m.erase_keys(fragment.deleted_keys);
-    m.override_key_values(fragment.key_values);
-    return m;
+  if (fragment.parent == nullptr) {
+      return fragment.key_values;
+  } else {
+      let m = AbsoluteValue(*fragment.parent);
+      m.erase_keys(fragment.deleted_keys);
+      m.override_key_values(fragment.key_values);
+      return m;
   }
 }
 ```

@@ -10,6 +10,9 @@
 
 #include "gtest/gtest.h"
 
+using std::vector;
+using quick::lazy_map;
+
 struct CopyMoveCounter {
   using This = CopyMoveCounter;
   struct Info {
@@ -38,8 +41,6 @@ struct CopyMoveCounter {
   }
   Info* info_;
 };
-
-namespace quick {
 
 template<typename M>
 std::unordered_set<typename M::key_type> GetKeys(const M& m) {
@@ -130,7 +131,7 @@ TEST(LazyMapTest, IteratorTest) {
   m2.insert(4, 40);
   m2.detach();
   std::set<std::pair<int, int>> v1(m2.begin(), m2.end());
-  std::set<std::pair<int, int>> v2 = {{1, 10}, {2, 20}, {3, 30}, {4, 40}};
+  std::set<std::pair<int, int>> v2 {{1, 10}, {2, 20}, {3, 30}, {4, 40}};
   EXPECT_EQ(v2, v1);
   EXPECT_FALSE(m2.detach());
   EXPECT_FALSE(m1.detach());
@@ -182,7 +183,101 @@ TEST(LazyMapTest, CopyMoveInsertion) {
   EXPECT_EQ(1, info.total());
 }
 
-}  // namespace quick
+TEST(LazyMapTest, MoveMethod) {
+  lazy_map<int, vector<int>> m = {{10, {1, 2, 3}}, {20, {4, 5, 6}}};
+  auto v = m.move(20);
+  EXPECT_EQ((vector<int>{4, 5, 6}), v);
+  v.push_back(7);
+  m.insert_or_assign(20, std::move(v));
+  EXPECT_EQ((vector<int>{4, 5, 6, 7}), m.at(20));
+  auto m2 = m;
+  auto v2 = m.move(10);
+  EXPECT_EQ((vector<int>{1, 2, 3}), v2);
+  EXPECT_EQ((vector<int>{1, 2, 3}), m.at(10));
+  v2.push_back(9);
+  m.insert_or_assign(10, std::move(v2));
+  EXPECT_EQ((vector<int>{1, 2, 3, 9}), m.at(10));
+  EXPECT_EQ((vector<int>{1, 2, 3}), m2.at(10));
+}
+
+TEST(LazyMapTest, MoveMethodPerf) {
+  quick::lazy_map<int, CopyMoveCounter> m;
+  CopyMoveCounter::Info info;
+  {
+    m.insert(10, CopyMoveCounter(&info));
+    m.insert(20, CopyMoveCounter(&info));
+    EXPECT_EQ(0, info.copies());
+  }
+  info.reset();
+  {
+    // When value for a key is moved from map, and the value is not shared
+    // by other objects, then value should not be copied.
+    auto v = m.move(10);
+    EXPECT_EQ(1, info.moves());
+    EXPECT_EQ(0, info.copies());
+    EXPECT_EQ(0, info.value_ctr);
+  }
+  info.reset();
+  {
+    // Moved-from value for key 10 is assigned a different value.
+    // This operation should not invole copy.
+    m.insert_or_assign(10, CopyMoveCounter(&info));
+    EXPECT_EQ(1, info.move_assign);
+    EXPECT_EQ(1, info.value_ctr);
+    EXPECT_EQ(0, info.copies());
+    EXPECT_EQ(2, info.total());
+  }
+  {
+    // value for key=10 is moved from map but this value is shared by another
+    // object, hence it will be copied.
+    auto m2 = m;
+    info.reset();
+    auto v2 = m.move(10);  
+    EXPECT_EQ(0, info.moves());
+    EXPECT_EQ(1, info.copies());
+    EXPECT_EQ(0, info.value_ctr);
+  }
+  info.reset();
+  {
+    // Here map is not shared. It's earlier shareholder (m2) is out of scope.
+    // Hence moving value for key 10 will not fall back to coping.
+    auto v = m.move(10);
+    EXPECT_EQ(1, info.moves());
+    EXPECT_EQ(0, info.copies());
+    EXPECT_EQ(0, info.value_ctr);
+  }
+  {
+    // When map value is not shared by another object, 'move_only' method
+    // returns non-empty value for key 10.
+    auto optional_value = m.move_only(10);
+    EXPECT_TRUE(optional_value.has_value());
+    auto m2 = m;
+    // When map value is not shared by another object, 'move_only' method
+    // returns empty std::optional for key 10.
+    auto optional_value2 = m.move_only(10);
+    EXPECT_FALSE(optional_value2.has_value());
+  }
+}
+
+TEST(LazyMapTest, NonCopiableValueType) {
+  using std::unique_ptr;
+  using std::make_unique;
+  lazy_map<int, unique_ptr<int>> m;
+  m.insert(10, nullptr);
+  m.insert(20, make_unique<int>(6));
+  auto v = m.move_only(20);
+  EXPECT_TRUE(v.has_value());
+  EXPECT_TRUE((std::is_same<unique_ptr<int>&, decltype(v.value())>::value));
+  EXPECT_NE(v.value(), nullptr);
+  EXPECT_EQ(6, *v.value());
+  *v.value() = 7;
+  m.insert_or_assign(20, std::move(v.value()));
+  EXPECT_NE(nullptr, m.at(20));
+  EXPECT_EQ(7, *m.at(20));
+  auto m2 = m;
+  auto v2 = m.move_only(20);
+  EXPECT_FALSE(v2.has_value());
+}
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
