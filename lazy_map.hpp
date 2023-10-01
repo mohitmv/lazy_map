@@ -1,4 +1,4 @@
-// Author: Mohit Saini (mohit.saini@thoughtspot.com)
+// Author: Mohit Saini (mohitsaini1196@gmail.com)
 
 // The documentation (lazy_map.md) MUST be read twice
 // before using this utility.
